@@ -12,10 +12,11 @@ fn main() {
 
     let bindings = bindgen::Builder::default()
         .header("/usr/include/dqlite.h")
-
         .allowlist_function("dqlite_.*")
         .allowlist_type("dqlite.*")
         .allowlist_var("DQLITE_.*")
+        .rust_target("1.81.0".parse().unwrap()) // rust-bindgen issue #3052 solution
+        .layout_tests(false) // solves unstable library feature 'offset_of'
         .generate()
         .expect("bindgen failed");
 
@@ -24,7 +25,7 @@ fn main() {
         .expect("couldn't write bindings");
 
     println!("cargo:rustc-link-lib=dqlite");
-    println!("cargo:rustc-link-lib-uv");
+    println!("cargo:rustc-link-lib=uv");
     println!("cargo:rustc-link-lib=sqlite3");
     println!("cargo:rustc-link-lib=lz4");
 }

@@ -5,7 +5,7 @@
 ``` shell
 
 sudo apt install -y build-essential pkg-config autoconf automake libtool \
-    libuv1-dev libsqlite3-dev liblz4-dev
+    libuv1-dev libsqlite3-dev liblz4-dev llvm-dev libclang-dev clang
 
 sudo add-apt-repository ppa:dqlite/dev -y
 
