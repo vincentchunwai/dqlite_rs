@@ -93,6 +93,7 @@ pub struct Node {
 type ConnectRegistry =
     std::collections::HashMap<u64, Box<dyn Fn(&str) -> Result<RawFd, String> + Send + Sync>>;
 
+
 impl Node {
     pub fn new(id: u64, address: &str, dir: &str) -> Result<Self, DqliteError> {
         let c_address = CString::new(address)?;
@@ -123,12 +124,17 @@ impl Node {
 
     pub fn set_bind_address(&self, address: &str) -> Result<(), DqliteError> {
         let c_address = CString::new(address)?;
-        let rc = unsafe { dqlite_note_set_bind_address(self.node, c_address.as_ptr()) };
+        let rc = unsafe { dqlite_node_set_bind_address(self.node, c_address.as_ptr()) };
 
         if rc != 0 {
+            let err_msg = unsafe {
+                CStr::from_ptr(dqlite_node_errmsg(self.node))
+                    .to_string_lossy()
+                    .into_owned()
+            };
             return Err(DqliteError::Configuration(format!(
                 "Failed to set bind address: {}",
-                rc
+                err_msg
             )));
         }
         Ok(())
@@ -137,8 +143,14 @@ impl Node {
     pub fn set_network_latency(&self, nanoseconds: u64) -> Result<(), DqliteError> {
         let rc = unsafe { dqlite_node_set_network_latency(self.node, nanoseconds) };
         if rc != 0 {
+            let err_msg = unsafe {
+                CStr::from_ptr(dqlite_node_errmsg(self.node))
+                    .to_string_lossy()
+                    .into_owned()
+            };
             return Err(DqliteError::Configuration(format!(
-                "Failed to set network latency".into()
+                "Failed to set network latency: {}",
+                err_msg
             )));
         }
         Ok(())
@@ -152,8 +164,14 @@ impl Node {
         let rc =
             unsafe { dqlite_node_set_snapshot_params_v2(self.node, threshold, trailing, strategy) };
         if rc != 0 {
+            let err_msg = unsafe {
+                CStr::from_ptr(dqlite_node_errmsg(self.node))
+                    .to_string_lossy()
+                    .into_owned()
+            };
             return Err(DqliteError::Configuration(format!(
-                "Failed to set snapshot params".into()
+                "Failed to set snapshot params: {}",
+                err_msg
             )));
         }
         Ok(())
