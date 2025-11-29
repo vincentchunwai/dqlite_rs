@@ -90,8 +90,9 @@ pub struct Node {
     connect_registry: Arc<Mutex<ConnectRegistry>>,
 }
 
+type ConnectHandle = u64;
 type ConnectRegistry =
-    std::collections::HashMap<u64, Box<dyn Fn(&str) -> Result<RawFd, String> + Send + Sync>>;
+    std::collections::HashMap<ConnectHandle, Box<dyn Fn(&str) -> Result<RawFd, String> + Send + Sync>>;
 
 
 impl Node {
