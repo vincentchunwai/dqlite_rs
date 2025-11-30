@@ -1,7 +1,9 @@
 use crate::bindings::{
     dqlite_node, dqlite_node_create, dqlite_node_destroy, dqlite_node_errmsg, dqlite_node_id,
     dqlite_node_set_network_latency, dqlite_node_set_snapshot_params_v2, dqlite_node_start,
-    dqlite_node_stop, dqlite_note_set_bind_address, DQLITE_ERROR, DQLITE_MISUSE, DQLITE_NOMEM,
+    dqlite_node_stop, dqlite_node_set_bind_address, 
+    dqlite_node_set_connect_func,
+    DQLITE_ERROR, DQLITE_MISUSE, DQLITE_NOMEM,
     DQLITE_OK, DQLITE_SNAPSHOT_TRAILING_DYNAMIC, DQLITE_SNAPSHOT_TRAILING_STATIC,
 };
 use libc::{SIGPIPE, SIG_IGN};
@@ -10,12 +12,58 @@ use std::fmt;
 use std::os::unix::io::RawFd;
 use std::ptr;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
+use tokio::sync::CancellationToken;
+use tokio::time::{timeout, Duration};
+use tokio::runtime::Handle;
+
+type ConnectHandle = u64;
+type ConnectRegistry = HashMap<ConnectHandle, Box<dyn Fn(&str) -> Result<RawFd, String> + Send + Sync>>;
+type ContextRegistry = HashMap<ConnectHandle, Arc<CancellationToken>>;
+
+// Global registry for connect functions
+lazy_static! {
+    static ref CONNECT_REGISTRY: Arc<Mutex<ConnectRegistry>> = {
+        Arc::new(Mutex::new(HashMap::new()))
+    };
+
+    static ref CONTEXT_REGISTRY: Arc<Mutex<ContextRegistry>> = {
+        Arc::new(Mutex::new(HashMap::new()))
+    };
+
+    static ref RUNTIME_HANDLE: Arc<Mutex<Option<Handle>>> = {
+        Arc::new(Mutex::new(None))
+    };
+}
+
+static CONNECT_INDEX: AtomicU64 = AtomicU64::new(100);
+
+// Initialize the runtime handle
+pub fn init_runtime_handle(handle: Handle) {
+    let mut rt = RUNTIME_HANDLE.lock().unwrap();
+    *rt = Some(handle);
+}
 
 // SIGPIPE terminates the process when a client disconnects while the server is writing a response
 // Ignore SIGPIPE globally at startup
 fn ignore_sigpipe() {
     unsafe {
         libc::signal(SIGPIPE, SIG_IGN);
+    }
+}
+
+// Helper function to safely extract error messages from dqlite_node
+fn get_node_error(node: *mut dqlite_node, default_msg: &str) -> String {
+    unsafe {
+        let err_ptr = dqlite_node_errmsg(node);
+        if err_ptr.is_null() {
+            default_msg.to_string()
+        } else {
+            CStr::from_ptr(err_ptr)
+                .to_string_lossy()
+                .into_owned()
+        }
     }
 }
 
@@ -87,12 +135,8 @@ struct SnapShotParams {
 
 pub struct Node {
     node: *mut dqlite_node,
-    connect_registry: Arc<Mutex<ConnectRegistry>>,
+    cancel_token: Arc<CancellationToken>,
 }
-
-type ConnectHandle = u64;
-type ConnectRegistry =
-    std::collections::HashMap<ConnectHandle, Box<dyn Fn(&str) -> Result<RawFd, String> + Send + Sync>>;
 
 
 impl Node {
@@ -100,6 +144,7 @@ impl Node {
         let c_address = CString::new(address)?;
         let c_dir = CString::new(dir)?;
         let c_id = id as dqlite_node_id;
+        let cancel_token = Arc::new(CancellationToken::new());
 
         let mut node_ptr: *mut dqlite_node = ptr::null_mut();
 
@@ -107,19 +152,14 @@ impl Node {
             unsafe { dqlite_node_create(c_id, c_address.as_ptr(), c_dir.as_ptr(), &mut node_ptr) };
 
         if rc != 0 {
-            let err_msg = unsafe {
-                CStr::from_ptr(dqlite_node_errmsg(node_ptr))
-                    .to_string_lossy()
-                    .into_owned()
-            };
-
+            let err_msg = get_node_error(node_ptr, &format!("Failed to create node: error code {}", rc));
             unsafe { dqlite_node_destroy(node_ptr) };
             return Err(DqliteError::NodeCreation(err_msg));
         }
 
         Ok(Node {
             node: node_ptr,
-            connect_registry: Arc::new(Mutex::new(ConnectRegistry::new())),
+            cancel_token,
         })
     }
 
@@ -128,11 +168,7 @@ impl Node {
         let rc = unsafe { dqlite_node_set_bind_address(self.node, c_address.as_ptr()) };
 
         if rc != 0 {
-            let err_msg = unsafe {
-                CStr::from_ptr(dqlite_node_errmsg(self.node))
-                    .to_string_lossy()
-                    .into_owned()
-            };
+            let err_msg = get_node_error(self.node, &format!("Failed to set bind address: error code {}", rc));
             return Err(DqliteError::Configuration(format!(
                 "Failed to set bind address: {}",
                 err_msg
@@ -144,11 +180,7 @@ impl Node {
     pub fn set_network_latency(&self, nanoseconds: u64) -> Result<(), DqliteError> {
         let rc = unsafe { dqlite_node_set_network_latency(self.node, nanoseconds) };
         if rc != 0 {
-            let err_msg = unsafe {
-                CStr::from_ptr(dqlite_node_errmsg(self.node))
-                    .to_string_lossy()
-                    .into_owned()
-            };
+            let err_msg = get_node_error(self.node, &format!("Failed to set network latency: error code {}", rc));
             return Err(DqliteError::Configuration(format!(
                 "Failed to set network latency: {}",
                 err_msg
@@ -165,11 +197,7 @@ impl Node {
         let rc =
             unsafe { dqlite_node_set_snapshot_params_v2(self.node, threshold, trailing, strategy) };
         if rc != 0 {
-            let err_msg = unsafe {
-                CStr::from_ptr(dqlite_node_errmsg(self.node))
-                    .to_string_lossy()
-                    .into_owned()
-            };
+            let err_msg = get_node_error(self.node, &format!("Failed to set snapshot params: error code {}", rc));
             return Err(DqliteError::Configuration(format!(
                 "Failed to set snapshot params: {}",
                 err_msg
@@ -181,11 +209,7 @@ impl Node {
     pub fn start(&self) -> Result<(), DqliteError> {
         let rc = unsafe { dqlite_node_start(self.node) };
         if rc != 0 {
-            let err_msg = unsafe {
-                CStr::from_ptr(dqlite_node_errmsg(self.node))
-                    .to_string_lossy()
-                    .into_owned()
-            };
+            let err_msg = get_node_error(self.node, &format!("Failed to start node: error code {}", rc));
             return Err(DqliteError::Start(err_msg));
         }
 
@@ -195,20 +219,20 @@ impl Node {
     pub fn stop(&self) -> Result<(), DqliteError> {
         let rc = unsafe { dqlite_node_stop(self.node) };
         if rc != 0 {
-            let err_msg = unsafe {
-                CStr::from_ptr(dqlite_node_errmsg(self.node))
-                    .to_string_lossy()
-                    .into_owned()
-            };
+            let err_msg = get_node_error(self.node, &format!("Failed to stop node: error code {}", rc));
             return Err(DqliteError::Stop(err_msg));
         }
         Ok(())
     }
+
 }
 
 // RAII wrapper for dqlite_node
 impl Drop for Node {
     fn drop(&mut self) {
+
+        self.cancel_token.cancel();
+
         if !self.node.is_null() {
             unsafe {
                 dqlite_node_destroy(self.node);
@@ -218,3 +242,134 @@ impl Drop for Node {
 }
 
 impl !Clone for Node {}
+
+
+// Custom Connect function for dqlite_server_set_connect_func
+#[no_mangle]
+pub extern "C" fn connect_with_dial(
+    handle: ConnectHandle,
+    address: *const libc::c_char,
+    fd: *mut libc::c_int,
+) -> libc::c_int {
+
+    let rt_handle = {
+        let rt = RUNTIME_HANDLE.lock().unwrap();
+        rt.clone.expect("Runtime handle not initialized")
+    };
+
+    // Get Global Connect Registry
+    let connect_reg = CONNECT_REGISTRY.lock().unwrap();
+    let context_reg = CONTEXT_REGISTRY.lock().unwrap();
+
+    let dial_fn = match connect_reg.get(&handle) {
+        Some(dial_fn) => dial_fn.clone(),
+        None => return 16, // RAFT_NOCONNECTION
+    };
+
+    let cancel_token = match context_reg.get(&handle) {
+        Some(token) => token.clone(),
+        None => return 16,
+    };
+
+    let addr_str = unsafe {
+        CStr::from_ptr(address)
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    drop(connect_reg);
+    drop(context_reg);
+
+    // Use the context for timeout and cancellation
+    let result = rt_handle.block_on(async {
+        let timeout_duration = Duration::from_secs(5);
+
+        let dial_future = async {
+            if cancel_token.is_cancelled(){
+                return Err("cancelled".to_string());
+            }
+
+            let mut dial_task = dial_fn(&addr_str);
+
+            tokio::select! {
+                result = &mut dial_task => {
+                    result
+                }
+                _ = cancel_token.cancelled() => {
+                    Err("cancelled".to_string())
+                }
+            }
+        };
+
+        timeout(timeout_duration, dial_future).await
+    });
+
+    match result {
+        Ok(Ok(socket_fd)) => {
+            unsafe { *fd = socket_fd as libc::c_int };
+            0
+        }
+        Ok(Err(_)) => 16, // RAFT_NOCONNECTION
+        Err(_) => 16
+    }
+}
+
+// C trampoline function to get passed to dqlite_node_set_connect_func
+extern "C" fn connect_trampoline(
+    data: *mut libc::c_void,
+    address: *const libc::c_char,
+    fd: *mut libc::c_int,
+) -> libc::c_int {
+    let handle = data as ConnectHandle;
+    connect_with_dial(handle, address, fd)
+}
+
+
+impl Node {
+    pub fn set_dial_func<F>(&self, dial: F) -> Result<(), DqliteError>
+    where
+        F: Fn(&str) -> Result<RawFd, String> + Send + Sync + 'static,
+    {
+        // Get next handle (thread-safe increment)
+        let handle = CONNECT_INDEX.fetch_add(1, Ordering::SeqCst);
+        
+        // Wrap the async function in a boxed future
+        let dial_fn: Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<RawFd, String>> + Send>> + Send + Sync> = 
+            Arc::new(move |addr: String| {
+                Box::pin(dial(addr))
+            });
+
+        let mut connect_reg = CONNECT_REGISTRY.lock().unwrap();
+        let mut context_reg = CONTEXT_REGISTRY.lock().unwrap();
+
+        connect_reg.insert(handle, Box::new(dial));
+        context_reg.insert(handle, self.cancel_token.clone());
+
+        drop(connect_reg);
+        drop(context_reg);
+
+        // Pass handle (as void*) and trampoline function to dqlite_node_set_connect_func
+        let rc = unsafe {
+            dqlite_node_set_connect_func(
+                self.node,
+                connect_trampoline,
+                handle as *mut libc::c_void,
+            )
+        };
+
+        if rc != 0 {
+            // Cleanup on error
+            let mut connect_reg = CONNECT_REGISTRY.lock().unwrap();
+            let mut context_reg = CONTEXT_REGISTRY.lock().unwrap();
+            connect_reg.remove(&handle);
+            context_reg.remove(&handle);
+
+            let err_msg = get_node_error(self.node, &format!("Failed to set dial function: error code {}", rc));
+
+            return Err(DqliteError::Configuration(format!(
+                "Failed to set dial function: {}",
+                err_msg
+            )));
+        }
+    }
+}
