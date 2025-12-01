@@ -2,7 +2,9 @@ use crate::bindings::{
     dqlite_node, dqlite_node_create, dqlite_node_destroy, dqlite_node_errmsg, dqlite_node_id,
     dqlite_node_set_network_latency, dqlite_node_set_snapshot_params_v2, dqlite_node_start,
     dqlite_node_stop, dqlite_node_set_bind_address, 
-    dqlite_node_set_connect_func,
+    dqlite_node_set_connect_func, dqlite_node_set_failure_domain,
+    dqlite_node_set_busy_timeout, dqlite_node_set_block_size,
+    dqlite_node_get_bind_address
     DQLITE_ERROR, DQLITE_MISUSE, DQLITE_NOMEM,
     DQLITE_OK, DQLITE_SNAPSHOT_TRAILING_DYNAMIC, DQLITE_SNAPSHOT_TRAILING_STATIC,
 };
@@ -221,6 +223,85 @@ impl Node {
         if rc != 0 {
             let err_msg = get_node_error(self.node, &format!("Failed to stop node: error code {}", rc));
             return Err(DqliteError::Stop(err_msg));
+        }
+        Ok(())
+    }
+
+    pub fn set_failure_domain(&self, failure_domain: u64) -> Result<(), DqliteError> {
+        let code = failure_domain as std::os::raw::c_ulonglong;
+        let rc = unsafe { dqlite_node_set_failure_domain(self.node, code) };
+        if rc != 0 {
+            let err_msg = get_node_error(self.node, &format!("Failed to set failure domain: error code {}", rc));
+            return Err(DqliteError::Configuration(format!(
+                "Failed to set failure domain: {}",
+                err_msg
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn set_busy_timeout(&self, timeout: u64) -> Result<(), DqliteError> {
+        let ctimeout = timeout as std::os::raw::c_uint;
+        let rc = unsafe { dqlite_node_set_busy_timeout(self.node, ctimeout) };
+        if rc != 0 {
+            let err_msg = get_node_error(self.node, &format!("Failed to set busy timeout: error code {}", rc));
+            return Err(DqliteError::Configuration(format!(
+                "Failed to set busy timeout: {}",
+                err_msg
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn set_block_size(&self, size: usize) -> Result<(), DqliteError> {
+        let rc = unsafe { dqlite_node_set_block_size(self.node, size) };
+        if rc != 0 {
+            let err_msg = get_node_error(self.node, &format!("Failed to set block size: error code {}", rc));
+            return Err(DqliteError::Configuration(format!(
+                "Failed to set block size: {}",
+                err_msg
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn set_auto_recovery(&self, enabled: bool) -> Result<(), DqliteError> {
+        let c_bool = enabled as std::os::raw::c_bool;
+        let rc = unsafe { dqlite_node_set_auto_recovery(self.node, c_bool) };
+        if rc != 0 {
+            let err_msg = get_node_error(self.node, &format!("Failed to set auto recovery: error code {}", rc));
+            return Err(DqliteError::Configuration(format!(
+                "Failed to set auto recovery: {}",
+                err_msg
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn get_bind_address(&self) -> Result<String, DqliteError> {
+        let address = unsafe { dqlite_node_get_bind_address(self.node) };
+        if address.is_null() {
+            return Err(DqliteError::Configuration("Failed to get bind address".to_string()));
+        }
+        let address_str = unsafe {
+            CStr::from_ptr(address)
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        Ok(address_str)
+    }
+
+    pub fn close(&self) -> Result<(), DqliteError> {
+        self.cancel_token.cancel();
+        
+        let rc = unsafe { dqlite_node_stop(self.node) };
+        if rc != 0 {
+            let err_msg = get_node_error(self.node, &format!("Failed to stop node: error code {}", rc));
+            return Err(DqliteError::Stop(format!(
+                "Failed to stop node: {}",
+                err_msg
+            )));
         }
         Ok(())
     }
