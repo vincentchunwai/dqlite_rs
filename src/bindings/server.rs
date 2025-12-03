@@ -4,7 +4,7 @@ use crate::bindings::{
     dqlite_node_stop, dqlite_node_set_bind_address, 
     dqlite_node_set_connect_func, dqlite_node_set_failure_domain,
     dqlite_node_set_busy_timeout, dqlite_node_set_block_size,
-    dqlite_node_get_bind_address
+    dqlite_node_get_bind_address, dqlite_node_describe_last_entry,
     DQLITE_ERROR, DQLITE_MISUSE, DQLITE_NOMEM,
     DQLITE_OK, DQLITE_SNAPSHOT_TRAILING_DYNAMIC, DQLITE_SNAPSHOT_TRAILING_STATIC,
 };
@@ -23,6 +23,8 @@ use tokio::runtime::Handle;
 type ConnectHandle = u64;
 type ConnectRegistry = HashMap<ConnectHandle, Box<dyn Fn(&str) -> Result<RawFd, String> + Send + Sync>>;
 type ContextRegistry = HashMap<ConnectHandle, Arc<CancellationToken>>;
+type RaftLogIndex = u64;
+type RaftLogTerm = u64;
 
 // Global registry for connect functions
 lazy_static! {
@@ -305,7 +307,42 @@ impl Node {
         }
         Ok(())
     }
+    
+    // TODO: Implement recover after protocol is implemented
+    pub fn recover(&self) -> Result<(), DqliteError> {
 
+    }
+
+    pub fn describe_last_entry(&self) -> Result<(RaftLogIndex, RaftLogTerm), DqliteError> {
+        let mut index: u64 = 0;
+        let mut term: u64 = 0;
+
+        let rc = unsafe { dqlite_node_describe_last_entry(self.node, &mut index, &mut term)};
+        if rc != 0 {
+            let err_msg = get_node_error(self.node, &format!("Failed to describe last entry: error code {}", rc));
+            return Err(DqliteError::Configuration(format!(
+                "Failed to describe last entry: {}",
+                err_msg
+            )));
+        }
+
+        Ok((index, term))
+    }
+
+    pub fn generate_id(address: &str) -> Result<u64, DqliteError> {
+        let c_address = CString::new(address)?;
+        let rc = unsafe { dqlite_node_generate_id(c_address.as_ptr()) };
+        if rc != 0 {
+            let err_msg = get_node_error(self.node, &format!("Failed to generate id: error code {}", rc));
+            return Err(DqliteError::Configuration(format!(
+                "Failed to generate id: {}",
+                err_msg
+            )));
+        }
+
+        Ok(id)
+    }
+    
 }
 
 // RAII wrapper for dqlite_node
