@@ -91,7 +91,8 @@ impl Write for Conn {
 }
 
 pub struct Connector {
-
+    clientID: u64,
+    store: 
 }
 
 pub struct LeaderTracker {

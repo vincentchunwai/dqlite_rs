@@ -1,6 +1,5 @@
 use parking_lot::Mutex;
 use std::sync::Arc;
-use std::os::unix::io::RawFd;
 use mod::connector::Conn;
 
 // Short lived per-connection instance
