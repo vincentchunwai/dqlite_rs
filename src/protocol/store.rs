@@ -2,6 +2,9 @@ use serde::{Serialize, Deserialize};
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
+use std::path::PathBuf;
+use rusqlite::{Connection as SqliteConnection, params, Result as SqliteResult};
+use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NodeRole(u8);
@@ -141,6 +144,33 @@ pub enum NodeStoreError {
 }
 
 pub type NodeStoreResult<T> = Result<T, NodeStoreError>;
+
+#[async_trait]
+pub trait NodeStore: Send + Sync {
+    /// Get all nodes
+    async fn get_all(&self) -> NodeStoreResult<Vec<NodeInfo>>;
+    
+    /// Get a single node by ID
+    async fn get_by_id(&self, id: NodeId) -> NodeStoreResult<Option<NodeInfo>>;
+    
+    /// Get a single node by address
+    async fn get_by_address(&self, address: &str) -> NodeStoreResult<Option<NodeInfo>>;
+    
+    /// Set all nodes (atomic replace)
+    async fn set_all(&self, nodes: Vec<NodeInfo>) -> NodeStoreResult<()>;
+    
+    /// Add or update a single node
+    async fn upsert(&self, node: NodeInfo) -> NodeStoreResult<()>;
+    
+    /// Remove a node by ID
+    async fn remove(&self, id: NodeId) -> NodeStoreResult<bool>;
+    
+    /// Get the store version (for optimistic locking)
+    async fn version(&self) -> NodeStoreResult<NodeVersion>;
+    
+    /// Set with version check (optimistic locking)
+    async fn set_if_version(&self, nodes: Vec<NodeInfo>, version: NodeVersion) -> NodeStoreResult<()>;
+}
 
 pub struct NodeStoreBackend {
     nodes: Arc<RwLock<HashMap<u64, NodeInfo>>>,
@@ -308,5 +338,140 @@ impl NodeStore for InMemoryNodeStore {
 }
 
 pub struct YamlNodeStore {
-    backend: NodeStoreBackend
+    backend: NodeStoreBackend,
+    path: PathBuf,
+}
+
+impl YamlNodeStore {
+    pub async fn new<P: AsRef<Path>>(path: P) -> NodeStoreResult<Self> {
+        let path = path.as_ref().to_path_buf();
+
+        let backend = if path.exists() {
+            let content = fs::read_to_string(&path).await?;
+            let nodes: Vec<NodeInfo> = serde_yaml::from_str(&content)
+                .map_err(|e| NodeStoreError::Serialization(e.to_string()))?;
+
+            NodeStoreBackend::from_nodes(nodes)?;
+        } else {
+            NodeStoreBackend::new()
+        };
+
+        Ok(Self { backend, path })
+    }
+
+    async fn save(&self) -> NodeStoreResult<()> {
+        let nodes = self.backend.get_all();
+
+        let yaml = serde_yaml::to_string(&nodes)
+            .map_err(|e| NodeStoreError::Serialization(e.to_string()))?;
+
+        let temp_path = self.path.with_extension("tmp");
+        let mut file = fs::File::create(&temp_path).await?;
+        file.write_all(yaml.as_bytes()).await?;
+        file.sync_all().await?;
+        drop(file);
+
+        fs::rename(&temp_path, &self.path).await?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl NodeStore for YamlNodeStore {
+    async fn get_all(&self) -> NodeStoreResult<Vec<NodeInfo>> {
+        Ok(self.backend.get_all())
+    }
+    
+    async fn get_by_id(&self, id: u64) -> NodeStoreResult<Option<NodeInfo>> {
+        Ok(self.backend.get_by_id(id))
+    }
+    
+    async fn get_by_address(&self, address: &str) -> NodeStoreResult<Option<NodeInfo>> {
+        Ok(self.backend.get_by_address(address))
+    }
+    
+    async fn set_all(&self, nodes: Vec<NodeInfo>) -> NodeStoreResult<()> {
+        self.backend.set_all(nodes)?;
+        self.save().await
+    }
+    
+    async fn upsert(&self, node: NodeInfo) -> NodeStoreResult<()> {
+        self.backend.upsert(node)?;
+        self.save().await
+    }
+    
+    async fn remove(&self, id: u64) -> NodeStoreResult<bool> {
+        let removed = self.backend.remove(id);
+        if removed {
+            self.save().await?;
+        }
+        Ok(removed)
+    }
+    
+    async fn version(&self) -> NodeStoreResult<u64> {
+        Ok(self.backend.version())
+    }
+    
+    async fn set_if_version(&self, nodes: Vec<NodeInfo>, expected_version: u64) -> NodeStoreResult<()> {
+        self.backend.set_if_version(nodes, expected_version)?;
+        self.save().await
+    }
+}
+
+pub struct DatabaseNodeStore {
+    db: Arc<Mutex<SqliteConnection>>,
+    version: Arc<RwLock<NodeVersion>>,
+}
+
+
+impl DatabaseNodeStore {
+    pub async fn new<P: AsRef<Path>>(path: P) -> NodeStoreResult<Self> {
+        let conn = SqliteConnection::open(path)
+            .map_err(|e| NodeStoreError::Store(e.to_string()))?;
+
+        // Create table with ALL fields (id, address, role, updated_at)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS servers (
+                id INTEGER PRIMARY KEY,
+                address TEXT NOT NULL UNIQUE,
+                role INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        )
+        .map_err(|e| NodeStoreError::Store(e.to_string()))?;
+
+        Ok(Self {
+            db: Arc::new(Mutex::new(conn)),
+            version: Arc::new(RwLock::new(0)),
+        })
+    }
+}
+
+#[async_trait]
+impl NodeStore for DatabaseNodeStore {
+    async fn get_all(&self) -> NodeStoreResult<Vec<NodeInfo>> {
+        let db = self.db.lock().await;
+        let mut stmt = db
+            .prepare("SELECT id, address, role FROM servers")
+            .map_err(|e| NodeStoreError::Store(e.to_string()))?;
+
+        let nodes = stmt
+            .query_map([], |row| {
+                Ok(NodeInfo {
+                    id: row.get(0)?,
+                    addr: row.get(1)?,
+                    role: match row.get::<_, i64>(2)? {
+                        0 => NodeRole::VOTER,
+                        1 => NodeRole::STAND_BY,
+                        2 => NodeRole::SPARE,
+                        _ => return Err(rusqlite::Error::InvalidColumnType(2, "role", rusqlite::types::Type::Integer)),
+                    }
+                })
+            })?
+            .collect::<SqliteResult<Vec<_>>>()
+            .map_err(|e| NodeStoreError::Store(e.to_string()))?;
+
+        Ok(nodes)
+    }
 }
