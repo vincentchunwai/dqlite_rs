@@ -1,8 +1,14 @@
 use serde::{Serialize, Deserialize};
 use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NodeRole(u8);
+
+type NodeAddress = String;
+type NodeId = u64;
+type NodeVersion = u64;
 
 impl NodeRole {
     pub const VOTER: NodeRole = NodeRole(0);
@@ -136,23 +142,171 @@ pub enum NodeStoreError {
 
 pub type NodeStoreResult<T> = Result<T, NodeStoreError>;
 
-#[async_trait]
-pub trait NodeStore: Send + Sync {
-    async fn get_all(&self) -> NodeStoreResult<Vec<NodeInfo>>;
-
-    async fn get_by_id(&self, id: u64) -> NodeStoreResult<Option<NodeInfo>>;
-
-    async fn get_by_address(&self, address: &str) -> NodeStoreResult<Option<NodeInfo>>;
-
-    async fn set_all(&self, nodes: Vec<NodeInfo>) -> NodeStoreResult<()>;
-
-    async fn upsert(&self, node: NodeInfo) -> NodeStoreResult<()>;
-
-    async fn remove(&self, id: u64) -> NodeStoreResult<bool>;
-
-    async fn version(&self) -> NodeStoreResult<u64>; // For optimistic concurrency control
-
-    async fn set_if_version(&self, node: NodeInfo, version: u64) -> NodeStoreResult<bool>;
+pub struct NodeStoreBackend {
+    nodes: Arc<RwLock<HashMap<u64, NodeInfo>>>,
+    addresses: Arc<RwLock<HashMap<String, u64>>>,
+    version: Arc<RwLock<u64>>,
 }
 
+impl NodeStoreBackend {
+    pub fn new() -> Self {
+        Self {
+            nodes: Arc::new(RwLock::new(HashMap::new())),
+            addresses: Arc::new(RwLock::new(HashMap::new())),
+            version: Arc::new(RwLock::new(0)),
+        }
+    }
+    
+    pub fn from_nodes(nodes: Vec<NodeInfo>) -> NodeStoreResult<Self> {
+        validate_nodes(&nodes)?;
+        
+        let mut nodes_map = HashMap::new();
+        let mut addresses_map = HashMap::new();
+        
+        for node in nodes {
+            nodes_map.insert(node.id, node);
+            addresses_map.insert(node.address.clone(), node.id);
+        }
+        
+        Ok(Self {
+            nodes: Arc::new(RwLock::new(nodes_map)),
+            addresses: Arc::new(RwLock::new(addresses_map)),
+            version: Arc::new(RwLock::new(0)),
+        })
+    }
+    
+    pub fn get_all(&self) -> Vec<NodeInfo> {
+        let nodes = self.nodes.read().unwrap();
+        nodes.values().copied().collect()
+    }
+    
+    pub fn get_by_id(&self, id: u64) -> Option<NodeInfo> {
+        let nodes = self.nodes.read().unwrap();
+        nodes.get(&id).copied()
+    }
+    
+    pub fn get_by_address(&self, address: &str) -> Option<NodeInfo> {
+        let addresses = self.addresses.read().unwrap();
+        if let Some(&id) = addresses.get(address) {
+            let nodes = self.nodes.read().unwrap();
+            nodes.get(&id).copied()
+        } else {
+            None
+        }
+    }
+    
+    pub fn set_all(&self, nodes: Vec<NodeInfo>) -> NodeStoreResult<()> {
+        validate_nodes(&nodes)?;
+        
+        let mut store = self.nodes.write().unwrap();
+        let mut addrs = self.addresses.write().unwrap();
+        let mut version = self.version.write().unwrap();
+        
+        store.clear();
+        addrs.clear();
+        
+        for node in nodes {
+            store.insert(node.id, node);
+            addrs.insert(node.address.clone(), node.id);
+        }
+        
+        *version += 1;
+        Ok(())
+    }
+    
+    pub fn upsert(&self, node: NodeInfo) -> NodeStoreResult<()> {
+        node.validate()?;
+        
+        let mut store = self.nodes.write().unwrap();
+        let mut addrs = self.addresses.write().unwrap();
+        let mut version = self.version.write().unwrap();
+        
+        if let Some(old_node) = store.get(&node.id) {
+            addrs.remove(&old_node.address);
+        }
+        
+        store.insert(node.id, node);
+        addrs.insert(node.address.clone(), node.id);
+        *version += 1;
+        
+        Ok(())
+    }
+    
+    pub fn remove(&self, id: u64) -> bool {
+        let mut store = self.nodes.write().unwrap();
+        let mut addrs = self.addresses.write().unwrap();
+        let mut version = self.version.write().unwrap();
+        
+        if let Some(node) = store.remove(&id) {
+            addrs.remove(&node.address);
+            *version += 1;
+            true
+        } else {
+            false
+        }
+    }
+    
+    pub fn version(&self) -> u64 {
+        let version = self.version.read().unwrap();
+        *version
+    }
+    
+    pub fn set_if_version(&self, nodes: Vec<NodeInfo>, expected_version: u64) -> NodeStoreResult<()> {
+        let current_version = self.version();
+        if current_version != expected_version {
+            return Err(NodeStoreError::VersionConflict);
+        }
+        self.set_all(nodes)
+    }
+}
 
+pub struct InMemoryNodeStore {
+    backend: NodeStoreBackend,
+}
+
+impl InMemoryNodeStore {
+    pub fn new() -> Self {
+        Self {
+            backend: NodeStoreBackend::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl NodeStore for InMemoryNodeStore {
+    async fn get_all(&self) -> NodeStoreResult<Vec<NodeInfo>> {
+        Ok(self.backend.get_all())
+    }
+    
+    async fn get_by_id(&self, id: u64) -> NodeStoreResult<Option<NodeInfo>> {
+        Ok(self.backend.get_by_id(id))
+    }
+    
+    async fn get_by_address(&self, address: &str) -> NodeStoreResult<Option<NodeInfo>> {
+        Ok(self.backend.get_by_address(address))
+    }
+    
+    async fn set_all(&self, nodes: Vec<NodeInfo>) -> NodeStoreResult<()> {
+        self.backend.set_all(nodes)
+    }
+    
+    async fn upsert(&self, node: NodeInfo) -> NodeStoreResult<()> {
+        self.backend.upsert(node)
+    }
+    
+    async fn remove(&self, id: u64) -> NodeStoreResult<bool> {
+        Ok(self.backend.remove(id))
+    }
+    
+    async fn version(&self) -> NodeStoreResult<u64> {
+        Ok(self.backend.version())
+    }
+    
+    async fn set_if_version(&self, nodes: Vec<NodeInfo>, expected_version: u64) -> NodeStoreResult<()> {
+        self.backend.set_if_version(nodes, expected_version)
+    }
+}
+
+pub struct YamlNodeStore {
+    backend: NodeStoreBackend
+}
