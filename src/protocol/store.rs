@@ -1,10 +1,18 @@
 use serde::{Serialize, Deserialize};
+use serde::ser::Serializer;
+use serde::de::Deserializer;
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use rusqlite::{Connection as SqliteConnection, params, Result as SqliteResult};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
+use std::path::Path;
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
+use async_trait::async_trait;
+use thiserror::Error;
+
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NodeRole(u8);
@@ -195,7 +203,7 @@ impl NodeStoreBackend {
         
         for node in nodes {
             nodes_map.insert(node.id, node);
-            addresses_map.insert(node.address.clone(), node.id);
+            addresses_map.insert(node.addr.clone(), node.id);
         }
         
         Ok(Self {
@@ -237,7 +245,7 @@ impl NodeStoreBackend {
         
         for node in nodes {
             store.insert(node.id, node);
-            addrs.insert(node.address.clone(), node.id);
+            addrs.insert(node.addr.clone(), node.id);
         }
         
         *version += 1;
@@ -252,11 +260,11 @@ impl NodeStoreBackend {
         let mut version = self.version.write().unwrap();
         
         if let Some(old_node) = store.get(&node.id) {
-            addrs.remove(&old_node.address);
+            addrs.remove(&old_node.addr);
         }
         
         store.insert(node.id, node);
-        addrs.insert(node.address.clone(), node.id);
+        addrs.insert(node.addr.clone(), node.id);
         *version += 1;
         
         Ok(())
@@ -268,7 +276,7 @@ impl NodeStoreBackend {
         let mut version = self.version.write().unwrap();
         
         if let Some(node) = store.remove(&id) {
-            addrs.remove(&node.address);
+            addrs.remove(&node.addr);
             *version += 1;
             true
         } else {
@@ -473,5 +481,245 @@ impl NodeStore for DatabaseNodeStore {
             .map_err(|e| NodeStoreError::Store(e.to_string()))?;
 
         Ok(nodes)
+    }
+
+    async fn get_by_id(&self, id: NodeId) -> NodeStoreResult<Option<NodeInfo>> {
+        let db = self.db.lock().await;
+        let mut stmt = db
+            .prepare("SELECT id, address, role FROM servers WHERE id = ?")
+            .map_err(|e| NodeStoreError::Store(e.to_string()))?;
+
+        let mut rows = stmt
+            .query_map(params![id], |row| {
+                Ok(NodeInfo {
+                    id: row.get(0)?,
+                    addr: row.get(1)?,
+                    role: match row.get::<_, i64>(2)? {
+                        0 => NodeRole::VOTER,
+                        1 => NodeRole::STAND_BY,
+                        2 => NodeRole::SPARE,
+                        _ => return Err(rusqlite::Error::InvalidColumnType(2, "role", rusqlite::types::Type::Integer)),
+                    },
+                })
+            })
+            .map_err(|e| NodeStoreError::Store(e.to_string()))?
+
+        if let Some(node) = rows.next() {
+            Ok(Some(node.map_err(|e| NodeStoreError::Store(e.to_string()))?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn get_by_address(&self, address: &str) -> NodeStoreResult<Option<NodeInfo>> {
+        let db = self.db.lock().await;
+        let mut stmt = db
+            .prepare("SELECT id, address, role FROM servers WHERE address = ?")
+            .map_err(|e| NodeStoreError::Store(e.to_string()))?;
+
+        let mut rows = stmt.query_map(params![address], |row| {
+            Ok(NodeInfo {
+                id: row.get(0)?,
+                addr: row.get(1)?,
+                role: match row.get::<_, i64>(2)? {
+                    0 => NodeRole::VOTER,
+                    1 => NodeRole::STAND_BY,
+                    2 => NodeRole::SPARE,
+                    _ => return Err(rusqlite::Error::InvalidColumnType(2, "role", rusqlite::types::Type::Integer)),
+                },
+            })
+        })
+        .map_err(|e| NodeStoreError::Store(e.to_string()))?;
+
+        if let Some(node) = rows.next() {
+            Ok(Some(node.map_err(|e| NodeStoreError::Store(e.to_string()))?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn set_all(&self, nodes: Vec<NodeInfo>) -> NodeStoreResult<()> {
+        validate_nodes(&nodes)?;
+
+        let db = self.db.lock().await;
+        let tx = db.transaction().map_err(|e| NodeStoreError::Store(e.to_string()))?;
+
+        // Get current node IDs to identify which ones to delete
+        let current_ids: Vec<u64> = tx
+            .prepare("SELECT id FROM servers")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |row| Ok(row.get::<_, u64>(0)?))
+                    .and_then(|rows| rows.collect::<SqliteResult<Vec<_>>>())
+            })
+            .map_err(|e| NodeStoreError::Store(e.to_string()))?;
+
+        let new_ids: HashSet<u64> = nodes.iter().map(|n| n.id).collect();
+
+        // Delete nodes not in the new list
+        for id in current_ids {
+            if !new_ids.contains(&id) {
+                tx.execute("DELETE FROM servers WHERE id = ?", params![id])
+                    .map_err(|e| NodeStoreError::Store(e.to_string()))?;
+            }
+        }
+
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO servers (id, address, role, updated_at)
+                VALUES (?1, ?2, ?3, strftime('%s', 'now'))
+                ON CONFLICT(id) DO UPDATE SET
+                    address = excluded.address,
+                    role = excluded.role,
+                    updated_at = excluded.updated_at
+            ")
+            .map_err(|e| NodeStoreError::Store(e.to_string()))?;
+
+        for node in nodes {
+            stmt.execute(params![node.id, node.addr, node.role.value() as i64])
+                .map_err(|e| NodeStoreError::Store(e.to_string()))?;
+        }
+
+        tx.commit().map_err(|e| NodeStoreError::Store(e.to_string()))?;
+
+        let mut version = self.version.write().unwrap();
+        *version += 1;
+        Ok(())
+    }
+
+    async fn upsert(&self, node: NodeInfo) -> NodeStoreResult<()> {
+        validate_nodes(&[node.clone()])?;
+
+        let db = self.db.lock().await;
+        let tx = db.transaction().map_err(|e| NodeStoreError::Store(e.to_string()))?;
+
+        let mut stmt = tx
+            .prepare(
+                "
+                INSERT INTO servers (id, address, role, updated_at)
+                VALUES (?1, ?2, ?3, strftime('%s', 'now'))
+                ON CONFLICT(address) DO UPDATE SET
+                    id = excluded.id,
+                    role = excluded.role,
+                    updated_at = excluded.updated_at
+                "
+            )
+            .map_err(|e| NodeStoreError::Store(e.to_string()))?;
+        
+        stmt.execute(params![node.id, node.addr, node.role.value() as i64])
+            .map_err(|e| NodeStoreError::Store(e.to_string()))?;
+
+        tx.commit().map_err(|e| NodeStoreError::Store(e.to_string()))?;
+
+        let mut version = self.version.write().unwrap();
+        *version += 1;
+        Ok(())
+    }
+
+    async fn remove(&self, id: NodeId) -> NodeStoreResult<bool> {
+        let db = self.db.lock().await;
+        let tx = db.transaction().map_err(|e| NodeStoreError::Store(e.to_string()))?;
+
+        let mut stmt = tx
+            .prepare("DELETE FROM servers WHERE id = ?")
+            .map_err(|e| NodeStoreError::Store(e.to_string()))?;
+
+        let result = stmt.execute(params![id])
+            .map_err(|e| NodeStoreError::Store(e.to_string()))?;
+        
+        tx.commit().map_err(|e| NodeStoreError::Store(e.to_string()))?;
+
+        let mut version = self.version.write().unwrap();
+        *version += 1;
+        Ok(result > 0)
+    }
+
+    async fn version(&self) -> NodeStoreResult<NodeVersion> {
+        let version = self.version.read().unwrap();
+        Ok(*version)
+    }
+
+    async fn set_if_version(&self, nodes: Vec<NodeInfo>, expected_version: NodeVersion) -> NodeStoreResult<()> {
+        let current_version = {
+            let version = self.version.read().unwrap();
+            *version
+        };
+        
+        if current_version != expected_version {
+            return Err(NodeStoreError::VersionConflict);
+        }
+
+        self.set_all(nodes).await?;
+        
+        Ok(())
+    }
+}
+
+pub struct ObservableNodeStore<S: NodeStore + Send + Sync> {
+    store: Arc<S>,
+    tx: broadcast::Sender<Vec<NodeInfo>>,
+}
+
+impl<S: NodeStore + Send + Sync> ObservableNodeStore<S> {
+    pub fn new(store: S) -> Self {
+        let (tx, _) = broadcast::channel(100);
+        Self {
+            store: Arc::new(store),
+            tx,
+        }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<Vec<NodeInfo>> {
+        self.tx.subscribe()
+    }
+
+    async fn notify(&self, nodes: Vec<NodeInfo>) {
+        let _ = self.tx.send(nodes);
+    }
+}
+
+#[async_trait]
+impl<S: NodeStore + Send + Sync> NodeStore for ObservableNodeStore<S> {
+    async fn get_all(&self) -> NodeStoreResult<Vec<NodeInfo>> {
+        self.store.get_all().await
+    }
+    
+    async fn get_by_id(&self, id: NodeId) -> NodeStoreResult<Option<NodeInfo>> {
+        self.store.get_by_id(id).await
+    }
+    
+    async fn get_by_address(&self, address: &str) -> NodeStoreResult<Option<NodeInfo>> {
+        self.store.get_by_address(address).await
+    }
+    
+    async fn set_all(&self, nodes: Vec<NodeInfo>) -> NodeStoreResult<()> {
+        self.store.set_all(nodes.clone()).await?;
+        self.notify(nodes).await;
+        Ok(())
+    }
+    
+    async fn upsert(&self, node: NodeInfo) -> NodeStoreResult<()> {
+        self.store.upsert(node.clone()).await?;
+        let nodes = self.store.get_all().await?;
+        self.notify(nodes).await;
+        Ok(())
+    }
+    
+    async fn remove(&self, id: NodeId) -> NodeStoreResult<bool> {
+        let result = self.store.remove(id).await?;
+        if result {
+            let nodes = self.store.get_all().await?;
+            self.notify(nodes).await;
+        }
+        Ok(result)
+    }
+    
+    async fn version(&self) -> NodeStoreResult<NodeVersion> {
+        self.store.version().await
+    }
+    
+    async fn set_if_version(&self, nodes: Vec<NodeInfo>, version: NodeVersion) -> NodeStoreResult<()> {
+        self.store.set_if_version(nodes.clone(), version).await?;
+        self.notify(nodes).await;
+        Ok(())
     }
 }
