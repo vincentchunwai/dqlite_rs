@@ -11,7 +11,7 @@ use crate::bindings::{
 use libc::{SIGPIPE, SIG_IGN};
 use std::ffi::{CStr, CString};
 use std::fmt;
-use std::os::unix::io::RawFd;
+use crate::protocol::connector::Conn;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,7 +21,7 @@ use tokio::time::{timeout, Duration};
 use tokio::runtime::Handle;
 
 type ConnectHandle = u64;
-type ConnectRegistry = HashMap<ConnectHandle, Box<dyn Fn(&str) -> Result<RawFd, String> + Send + Sync>>;
+type ConnectRegistry = HashMap<ConnectHandle, Box<DialFunc>;
 type ContextRegistry = HashMap<ConnectHandle, Arc<CancellationToken>>;
 type RaftLogIndex = u64;
 type RaftLogTerm = u64;
@@ -446,15 +446,15 @@ extern "C" fn connect_trampoline(
 impl Node {
     pub fn set_dial_func<F>(&self, dial: F) -> Result<(), DqliteError>
     where
-        F: Fn(&str) -> Result<RawFd, String> + Send + Sync + 'static,
+        F: Fn(&str) -> Result<Conn, String> + Send + Sync + 'static,
     {
         // Get next handle (thread-safe increment)
         let handle = CONNECT_INDEX.fetch_add(1, Ordering::SeqCst);
         
         // Wrap the async function in a boxed future
-        let dial_fn: Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<RawFd, String>> + Send>> + Send + Sync> = 
+        let dial_fn: Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<DialFunc> = 
             Arc::new(move |addr: String| {
-                Box::pin(dial(addr))
+                Box::pin(dial_fn(addr))
             });
 
         let mut connect_reg = CONNECT_REGISTRY.lock().unwrap();
