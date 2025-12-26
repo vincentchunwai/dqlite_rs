@@ -1,7 +1,9 @@
 use parking_lot::Mutex;
-use mod::protocol::Protocol;
-use std::sync::Arc;
-use std::io::{Read, Write};
+use crate::protocol::Protocol;
+use crate::protocol::store::{NodeStore, ObservableNodeStore};
+use crate::protocol::config::Config;
+use std::sync::{Arc, Weak};
+use std::io::{self, Read, Write};
 use std::net::{TcpStream, SocketAddr as TcpSocketAddr};
 use std::os::unix::net::{UnixStream, SocketAddr as UnixSocketAddr};
 
@@ -90,9 +92,27 @@ impl Write for Conn {
     }
 }
 
-pub struct Connector {
+pub fn dial(addr: &str) -> Result<Conn, String> {
+    if addr.starts_with("unix:") {
+        let path = addr[5..];
+        let stream = UnixStream::connect(path).map_err(|e| e.to_string())?;
+        Ok(Conn::from_unix(stream))
+    } else {
+        let addr = addr.parse::<TcpSocketAddr>().map_err(|e| e.to_string())?;
+        let stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
+        Ok(Conn::from_tcp(stream))
+    }
+}
+
+pub type DialFunc = Arc<dyn Fn(&str) -> Result<Conn, String> + Send + Sync + 'static>;
+
+pub struct Connector<S: NodeStore + Send + Sync> {
     clientID: u64,
-    store: 
+    store: Arc<ObservableNodeStore<S>>,
+    nodeID: u64,
+    nodeAddr: String,
+    lt: Mutex<Option<Weak<LeaderTracker>>>,
+    config: Arc<Config>,
 }
 
 pub struct LeaderTracker {
