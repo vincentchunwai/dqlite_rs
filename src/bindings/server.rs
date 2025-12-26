@@ -5,6 +5,7 @@ use crate::bindings::{
     dqlite_node_set_connect_func, dqlite_node_set_failure_domain,
     dqlite_node_set_busy_timeout, dqlite_node_set_block_size,
     dqlite_node_get_bind_address, dqlite_node_describe_last_entry,
+    dqlite_generate_node_id,
     DQLITE_ERROR, DQLITE_MISUSE, DQLITE_NOMEM,
     DQLITE_OK, DQLITE_SNAPSHOT_TRAILING_DYNAMIC, DQLITE_SNAPSHOT_TRAILING_STATIC,
 };
@@ -12,6 +13,7 @@ use libc::{SIGPIPE, SIG_IGN};
 use std::ffi::{CStr, CString};
 use std::fmt;
 use crate::protocol::connector::Conn;
+use crate::protocol::connector::DialFunc;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,7 +23,7 @@ use tokio::time::{timeout, Duration};
 use tokio::runtime::Handle;
 
 type ConnectHandle = u64;
-type ConnectRegistry = HashMap<ConnectHandle, Box<DialFunc>;
+type ConnectRegistry = HashMap<ConnectHandle, Box<DialFunc>>;
 type ContextRegistry = HashMap<ConnectHandle, Arc<CancellationToken>>;
 type RaftLogIndex = u64;
 type RaftLogTerm = u64;
@@ -310,7 +312,7 @@ impl Node {
     
     // TODO: Implement recover after protocol is implemented
     pub fn recover(&self) -> Result<(), DqliteError> {
-
+        Err(DqliteError::Configuration("Not implemented yet".to_string()))
     }
 
     pub fn describe_last_entry(&self) -> Result<(RaftLogIndex, RaftLogTerm), DqliteError> {
@@ -329,17 +331,9 @@ impl Node {
         Ok((index, term))
     }
 
-    pub fn generate_id(address: &str) -> Result<u64, DqliteError> {
+    pub fn generate_id(address: &str) -> Result<dqlite_node_id, DqliteError> {
         let c_address = CString::new(address)?;
-        let rc = unsafe { dqlite_node_generate_id(c_address.as_ptr()) };
-        if rc != 0 {
-            let err_msg = get_node_error(self.node, &format!("Failed to generate id: error code {}", rc));
-            return Err(DqliteError::Configuration(format!(
-                "Failed to generate id: {}",
-                err_msg
-            )));
-        }
-
+        let id = unsafe { dqlite_generate_node_id(c_address.as_ptr())};
         Ok(id)
     }
     
@@ -369,10 +363,11 @@ pub extern "C" fn connect_with_dial(
     address: *const libc::c_char,
     fd: *mut libc::c_int,
 ) -> libc::c_int {
+    use std::os::unix::io::RawFd;
 
     let rt_handle = {
         let rt = RUNTIME_HANDLE.lock().unwrap();
-        rt.clone.expect("Runtime handle not initialized")
+        rt.clone().expect("Runtime handle not initialized")
     };
 
     // Get Global Connect Registry
@@ -407,15 +402,14 @@ pub extern "C" fn connect_with_dial(
                 return Err("cancelled".to_string());
             }
 
-            let mut dial_task = dial_fn(&addr_str);
+            let conn_result = tokio::task::spawn_blocking({
+                let addr = addr_str.clone();
+                move || dial_fn(&addr)
+            }).await.map_err(|e| e.to_string())?;
 
-            tokio::select! {
-                result = &mut dial_task => {
-                    result
-                }
-                _ = cancel_token.cancelled() => {
-                    Err("cancelled".to_string())
-                }
+            match conn_result {
+                Ok(conn) => Ok(conn.as_raw_fd() as RawFd),
+                Err(e) => Err(e),
             }
         };
 
@@ -450,12 +444,6 @@ impl Node {
     {
         // Get next handle (thread-safe increment)
         let handle = CONNECT_INDEX.fetch_add(1, Ordering::SeqCst);
-        
-        // Wrap the async function in a boxed future
-        let dial_fn: Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<DialFunc> = 
-            Arc::new(move |addr: String| {
-                Box::pin(dial_fn(addr))
-            });
 
         let mut connect_reg = CONNECT_REGISTRY.lock().unwrap();
         let mut context_reg = CONTEXT_REGISTRY.lock().unwrap();
@@ -489,5 +477,6 @@ impl Node {
                 err_msg
             )));
         }
+        Ok(())
     }
 }

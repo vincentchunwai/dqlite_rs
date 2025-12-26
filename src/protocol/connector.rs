@@ -5,7 +5,8 @@ use crate::protocol::config::Config;
 use std::sync::{Arc, Weak};
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, SocketAddr as TcpSocketAddr};
-use std::os::unix::net::{UnixStream, SocketAddr as UnixSocketAddr};
+use std::os::unix::net::{UnixStream, SocketAddr as UnixSocketAddr, RawFd};
+use std::os::unix::io::AsRawFd;
 
 // Unified address type
 #[derive(Debug, Clone)]
@@ -34,7 +35,7 @@ pub struct Conn {
 }
 
 impl Conn {
-    pub fn from_tcp((stream: TcpStream)) -> Self {
+    pub fn from_tcp(stream: TcpStream) -> Self {
         Self {
             inner: ConnectionType::Tcp(stream),
         }
@@ -63,6 +64,13 @@ impl Conn {
                 let addr = s.peer_addr()?;
                 Ok(Addr::Unix(addr.as_pathname().map(|p| p.to_owned())))
             }
+        }
+    }
+
+    pub fn as_raw_fd(&self) -> RawFd {
+        match &self.inner {
+            ConnectionType::Tcp(s) => s.as_raw_fd(),
+            ConnectionType::Unix(s) => s.as_raw_fd(),
         }
     }
 }
