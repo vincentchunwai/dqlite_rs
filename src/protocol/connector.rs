@@ -4,10 +4,12 @@ use crate::protocol::store::{NodeStore, ObservableNodeStore};
 use crate::protocol::config::Config;
 use std::sync::{Arc, Weak};
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, SocketAddr as TcpSocketAddr};
-use std::os::unix::net::{UnixStream, SocketAddr as UnixSocketAddr, RawFd};
+use tokio::net::{TcpStream, UnixStream, SocketAddr as TcpSocketAddr, UnixSocketAddr};
 use std::os::unix::io::AsRawFd;
-
+use std::pin::Pin;
+use std::future::Future;
+use std::net::SocketAddr as StdSocketAddr;
+use tokio::io::{AsyncRead, AsyncWrite};
 // Unified address type
 #[derive(Debug, Clone)]
 pub enum Addr {
@@ -68,34 +70,81 @@ impl Conn {
     }
 
     pub fn as_raw_fd(&self) -> RawFd {
-        match &self.inner {
+        match &self.inner { 
             ConnectionType::Tcp(s) => s.as_raw_fd(),
             ConnectionType::Unix(s) => s.as_raw_fd(),
         }
     }
 }
 
-impl Read for Conn {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match &mut self.inner {
-            ConnectionType::Tcp(s) => s.read(buf),
-            ConnectionType::Unix(s) => s.read(buf),
+impl AsyncRead for Conn {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut().inner {
+            ConnectionType::Tcp(ref mut s) => {
+                let result = Pin::new(s).poll_read(cx, buf);
+
+                return result;
+            }
+            ConnectionType::Unix(ref mut s) => {
+                let result = Pin::new(s).poll_read(cx, buf);
+
+                return result;
+            }
         }
     }
 }
 
-impl Write for Conn {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match &mut self.inner {
-            ConnectionType::Tcp(s) => s.write(buf),
-            ConnectionType::Unix(s) => s.write(buf),
+impl AsyncWrite for Conn {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut().inner {
+            ConnectionType::Tcp(ref mut s) => {
+                let result = Pin::new(s).poll_write(cx, buf);
+
+                return result;
+            }
+            ConnectionType::Unix(ref mut s) => {
+                let result = Pin::new(s).poll_write(cx, buf);
+
+                return result;
+            }
+        }
+    }
+    
+    fn poll_flush(self: Pin<&mut self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut().inner {
+            ConnectionType::Tcp(ref mut s) => {
+                let result = Pin::new(s).poll_flush(cx);
+
+                return result;
+            }
+            ConnectionType::Unix(ref mut s) => {
+                let result = Pin::new(s).poll_flush(cx);
+    
+                return result;
+            }
         }
     }
 
-    fn flush(&mut self) -> io::Result<()> {
-        match &mut self.inner {
-            ConnectionType::Tcp(s) => s.flush(),
-            ConnectionType::Unix(s) => s.flush(),
+    fn poll_shutdown(self: Pin<&mut self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut().inner {
+            ConnectionType::Tcp(ref mut s) => {
+                let result = Pin::new(s).poll_shutdown(cx);
+
+                return result;
+            }
+            ConnectionType::Unix(ref mut s) => {
+                let result = Pin::new(s).poll_shutdown(cx);
+
+                return result;
+            }
         }
     }
 }
@@ -103,16 +152,16 @@ impl Write for Conn {
 pub fn dial(addr: &str) -> Result<Conn, String> {
     if addr.starts_with("unix:") {
         let path = addr[5..];
-        let stream = UnixStream::connect(path).map_err(|e| e.to_string())?;
+        let stream = UnixStream::connect(path).await.map_err(|e| e.to_string())?;
         Ok(Conn::from_unix(stream))
     } else {
-        let addr = addr.parse::<TcpSocketAddr>().map_err(|e| e.to_string())?;
-        let stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
+        let addr = addr.parse::<StdSocketAddr>().map_err(|e| e.to_string())?;
+        let stream = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
         Ok(Conn::from_tcp(stream))
     }
 }
 
-pub type DialFunc = Arc<dyn Fn(&str) -> Result<Conn, String> + Send + Sync + 'static>;
+pub type DialFunc = Arc<dyn Fn(&str) -> Pin<Box<dyn Future<Output = Result<Conn, String>> + Send + Sync + 'static>> + Send + Sync + 'static>;
 
 pub struct Connector<S: NodeStore + Send + Sync> {
     clientID: u64,

@@ -23,7 +23,7 @@ use tokio::time::{timeout, Duration};
 use tokio::runtime::Handle;
 
 type ConnectHandle = u64;
-type ConnectRegistry = HashMap<ConnectHandle, Box<DialFunc>>;
+type ConnectRegistry = HashMap<ConnectHandle, DialFunc>;
 type ContextRegistry = HashMap<ConnectHandle, Arc<CancellationToken>>;
 type RaftLogIndex = u64;
 type RaftLogTerm = u64;
@@ -402,10 +402,7 @@ pub extern "C" fn connect_with_dial(
                 return Err("cancelled".to_string());
             }
 
-            let conn_result = tokio::task::spawn_blocking({
-                let addr = addr_str.clone();
-                move || dial_fn(&addr)
-            }).await.map_err(|e| e.to_string())?;
+            let conn_result = dial_fn(&addr_str).await;
 
             match conn_result {
                 Ok(conn) => Ok(conn.as_raw_fd() as RawFd),
@@ -440,15 +437,20 @@ extern "C" fn connect_trampoline(
 impl Node {
     pub fn set_dial_func<F>(&self, dial: F) -> Result<(), DqliteError>
     where
-        F: Fn(&str) -> Result<Conn, String> + Send + Sync + 'static,
+        F: Fn(&str) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Conn, String>> + Send + 'static,
     {
         // Get next handle (thread-safe increment)
         let handle = CONNECT_INDEX.fetch_add(1, Ordering::SeqCst);
 
+        let dial_fn: DialFunc = Arc::new(move |addr: &str| {
+            Box::pin(dial(addr))
+        });
+
         let mut connect_reg = CONNECT_REGISTRY.lock().unwrap();
         let mut context_reg = CONTEXT_REGISTRY.lock().unwrap();
 
-        connect_reg.insert(handle, Box::new(dial));
+        connect_reg.insert(handle, dial_fn);
         context_reg.insert(handle, self.cancel_token.clone());
 
         drop(connect_reg);
